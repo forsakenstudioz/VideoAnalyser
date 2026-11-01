@@ -60,6 +60,45 @@ def open_folder(path: Path) -> None:
         subprocess.Popen(["xdg-open", str(path)])
 
 
+SETTINGS_FILE = Path.home() / ".lecture_digest_gui.json"
+WHEN_DONE = ["Do nothing", "Put the PC to sleep", "Shut down the PC"]
+
+# (light, dark) colours for the app's own label styles
+THEMES = {
+    "light": {"bg": None, "fg": None, "field": None, "hint": "#666666", "muted": "#555555",
+              "good": "#1a7f37", "warn": "#b35900"},
+    "dark": {"bg": "#1f1f1f", "fg": "#e6e6e6", "field": "#2b2b2b", "hint": "#a0a0a0", "muted": "#b0b0b0",
+             "good": "#4ac26b", "warn": "#f0a050", "button": "#333333", "active": "#3d3d3d",
+             "border": "#454545", "accent": "#3b82f6"},
+}
+
+
+def load_settings() -> dict:
+    try:
+        return json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def save_settings(settings: dict) -> None:
+    try:
+        SETTINGS_FILE.write_text(json.dumps(settings), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def system_prefers_dark() -> bool:
+    if os.name != "nt":
+        return False
+    try:
+        import winreg
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                             r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize")
+        return winreg.QueryValueEx(key, "AppsUseLightTheme")[0] == 0
+    except OSError:
+        return False
+
+
 def fmt_duration(sec: float) -> str:
     sec = int(sec)
     h, m = sec // 3600, sec % 3600 // 60
@@ -72,36 +111,47 @@ class App(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("Lecture Digest")
-        self.geometry("820x760")
+        self.geometry("820x840")
         self.minsize(700, 560)
         self.proc: subprocess.Popen | None = None
         self.lines: queue.Queue[str | None] = queue.Queue()
 
-        self.input_var = tk.StringVar()
-        self.output_var = tk.StringVar(value=str(Path.home() / "Documents" / "LectureDigests"))
-        self.lang_var = tk.StringVar(value="Auto-detect")
-        self.quality_var = tk.StringVar(value=next(iter(QUALITY)))
-        self.ocr_var = tk.BooleanVar(value=True)
-        self.translate_var = tk.BooleanVar(value=False)
-        self.combined_var = tk.BooleanVar(value=True)
-        self.prompt_var = tk.StringVar()
+        self.settings = st = load_settings()
+        pick = lambda key, choices, default: st.get(key) if st.get(key) in choices else default  # noqa: E731
+        self.input_var = tk.StringVar(value=st.get("input", ""))
+        self.output_var = tk.StringVar(value=st.get("output") or str(Path.home() / "Documents" / "LectureDigests"))
+        self.lang_var = tk.StringVar(value=pick("language", LANGUAGES, "Auto-detect"))
+        self.quality_var = tk.StringVar(value=pick("quality", QUALITY, next(iter(QUALITY))))
+        self.ocr_var = tk.BooleanVar(value=st.get("ocr", True))
+        self.translate_var = tk.BooleanVar(value=st.get("translate", False))
+        self.combined_var = tk.BooleanVar(value=st.get("combined", True))
+        self.prompt_var = tk.StringVar(value=st.get("prompt", ""))
+        self.awake_var = tk.BooleanVar(value=st.get("keep_awake", True))
+        self.after_var = tk.StringVar(value=pick("when_done", WHEN_DONE, WHEN_DONE[0]))
+        self.sound_var = tk.BooleanVar(value=st.get("sound", True))
+        self.dark_var = tk.BooleanVar(value=st.get("dark", system_prefers_dark()))
         self.status_var = tk.StringVar(value="Choose a video or a folder of videos, then press Start.")
 
         self._build()
+        self._apply_theme()
         self.after(100, self._pump)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     # ------------------------------------------------------------------ UI --
     def _build(self) -> None:
         pad = {"padx": 10, "pady": 4}
-        style = ttk.Style(self)
-        if "vista" in style.theme_names():
-            style.theme_use("vista")
+        self.style = ttk.Style(self)
+        self.light_theme = "vista" if "vista" in self.style.theme_names() else self.style.theme_use()
 
         gpu = detect_gpu()
         gpu_text = (f"GPU found: {gpu}" if gpu else
                     "No NVIDIA GPU found - it will still work, but slowly. Install/update the NVIDIA driver to use your GPU.")
-        ttk.Label(self, text=gpu_text, foreground="#1a7f37" if gpu else "#b35900").pack(anchor="w", **pad)
+        top = ttk.Frame(self)
+        top.pack(fill="x", **pad)
+        ttk.Checkbutton(top, text="Dark mode", variable=self.dark_var,
+                        command=self._toggle_dark).pack(side="right")
+        ttk.Label(top, text=gpu_text, style="Good.TLabel" if gpu else "Warn.TLabel",
+                  wraplength=640).pack(side="left", anchor="w")
         if not gpu:
             self.quality_var.set("Light (small GPU or no GPU)")
 
@@ -113,6 +163,59 @@ class App(tk.Tk):
         nb.add(extra, text="  Extra frames  ")
         self._build_main(main)
         self._build_extra(extra)
+
+    def _toggle_dark(self) -> None:
+        self.settings["dark"] = self.dark_var.get()
+        save_settings(self.settings)
+        self._apply_theme()
+
+    def _apply_theme(self) -> None:
+        dark = self.dark_var.get()
+        c = THEMES["dark" if dark else "light"]
+        st = self.style
+        st.theme_use("clam" if dark else self.light_theme)
+        if dark:
+            st.configure(".", background=c["bg"], foreground=c["fg"], fieldbackground=c["field"],
+                         bordercolor=c["border"], lightcolor=c["border"], darkcolor=c["border"],
+                         troughcolor=c["field"], selectbackground=c["accent"], selectforeground="#ffffff",
+                         insertcolor=c["fg"])
+            st.map(".", foreground=[("disabled", "#777777")])
+            st.configure("TButton", background=c["button"])
+            st.map("TButton", background=[("active", c["active"]), ("disabled", c["bg"])])
+            st.configure("TNotebook", background=c["bg"])
+            st.configure("TNotebook.Tab", background=c["button"], padding=(10, 4))
+            st.map("TNotebook.Tab", background=[("selected", c["field"])])
+            st.map("TCombobox", fieldbackground=[("readonly", c["field"])],
+                   foreground=[("readonly", c["fg"])], background=[("readonly", c["button"])])
+            st.map("TCheckbutton", background=[("active", c["bg"])],
+                   indicatorcolor=[("selected", c["accent"]), ("!selected", c["field"])])
+            st.configure("Horizontal.TProgressbar", background=c["accent"])
+            st.configure("Vertical.TScrollbar", background=c["button"], troughcolor=c["field"],
+                         arrowcolor=c["fg"])
+            st.map("Vertical.TScrollbar", background=[("active", c["active"])])
+        bg = c["bg"] or st.lookup("TFrame", "background") or "SystemButtonFace"
+        for name, key in (("Hint", "hint"), ("Muted", "muted"), ("Good", "good"), ("Warn", "warn")):
+            st.configure(f"{name}.TLabel", foreground=c[key])
+        self.configure(background=bg)
+        self.option_add("*TCombobox*Listbox.background", c["field"] or "white")
+        self.option_add("*TCombobox*Listbox.foreground", c["fg"] or "black")
+        self.log.configure(background=c["field"] or "white", foreground=c["fg"] or "black",
+                           insertbackground=c["fg"] or "black")
+        self._dark_title_bar(dark)
+
+    def _dark_title_bar(self, dark: bool) -> None:
+        if os.name != "nt":
+            return
+        try:  # Windows 10 1809+ / 11: DWMWA_USE_IMMERSIVE_DARK_MODE
+            import ctypes
+            self.update_idletasks()
+            hwnd = ctypes.windll.user32.GetParent(self.winfo_id())
+            value = ctypes.c_int(1 if dark else 0)
+            ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 20, ctypes.byref(value), ctypes.sizeof(value))
+            self.withdraw()  # redraw so the title bar picks up the change
+            self.deiconify()
+        except (OSError, AttributeError):
+            pass
 
     def _row(self, parent, label, var, buttons):
         row = ttk.Frame(parent)
@@ -142,13 +245,23 @@ class App(tk.Tk):
         ttk.Label(r, text="Subject words:", width=16).pack(side="left")
         ttk.Entry(r, textvariable=self.prompt_var).pack(side="left", fill="x", expand=True)
         ttk.Label(opts, text="(optional) technical words used in the lectures, so they are spelled right, "
-                             "e.g. enthalpy, Kirchhoff, eigenvalue", foreground="#666").pack(anchor="w")
+                             "e.g. enthalpy, Kirchhoff, eigenvalue", style="Hint.TLabel").pack(anchor="w")
         ttk.Checkbutton(opts, text="Read the text on slides and the board (OCR)",
                         variable=self.ocr_var).pack(anchor="w", pady=1)
         ttk.Checkbutton(opts, text="Translate speech to English",
                         variable=self.translate_var).pack(anchor="w", pady=1)
         ttk.Checkbutton(opts, text="Also make one combined file of all lectures (ALL_LECTURES.md) for uploading to Claude",
                         variable=self.combined_var).pack(anchor="w", pady=1)
+
+        run = ttk.LabelFrame(f, text="While running and when finished", padding=8)
+        run.pack(fill="x", pady=(0, 6))
+        r = ttk.Frame(run)
+        r.pack(fill="x")
+        ttk.Checkbutton(r, text="Keep the PC awake", variable=self.awake_var).pack(side="left")
+        ttk.Checkbutton(r, text="Play a sound when done", variable=self.sound_var).pack(side="left", padx=16)
+        ttk.Label(r, text="When done:").pack(side="left", padx=(8, 4))
+        ttk.Combobox(r, textvariable=self.after_var, values=WHEN_DONE, state="readonly",
+                     width=20).pack(side="left")
 
         btns = ttk.Frame(f)
         btns.pack(fill="x", pady=4)
@@ -171,7 +284,7 @@ class App(tk.Tk):
                  ("eta", "Time left"), ("finish", "Finishes around")]
         for i, (key, label) in enumerate(cells):
             col = (i % 4) * 2
-            ttk.Label(stats, text=label + ":", foreground="#555").grid(row=i // 4, column=col, sticky="w", padx=(0, 4))
+            ttk.Label(stats, text=label + ":", style="Muted.TLabel").grid(row=i // 4, column=col, sticky="w", padx=(0, 4))
             var = self.stat_vars[key] = tk.StringVar(value="-")
             ttk.Label(stats, textvariable=var, font=("Segoe UI", 10, "bold")).grid(
                 row=i // 4, column=col + 1, sticky="w", padx=(0, 18))
@@ -183,7 +296,7 @@ class App(tk.Tk):
         self.log.configure(yscrollcommand=sb.set)
         self.log.pack(side="left", fill="both", expand=True)
         sb.pack(side="right", fill="y")
-        ttk.Label(f, foreground="#666", wraplength=760,
+        ttk.Label(f, style="Hint.TLabel", wraplength=760,
                   text="You can stop at any time. Press Start again later and it continues where it stopped. "
                        "When it is done, give Claude the digests folder (or upload ALL_LECTURES.md) and ask your questions.").pack(anchor="w")
 
@@ -205,7 +318,7 @@ class App(tk.Tk):
             ttk.Label(r, text=label).pack(side="left")
             ttk.Entry(r, textvariable=var, width=w).pack(side="left", padx=4)
         ttk.Button(f, text="Save pictures", command=self._extra_frames).pack(anchor="w", pady=6)
-        ttk.Label(f, foreground="#666", text="Pictures go into the lecture's 'extra_frames' folder, "
+        ttk.Label(f, style="Hint.TLabel", text="Pictures go into the lecture's 'extra_frames' folder, "
                                              "which opens when they are ready.").pack(anchor="w")
 
     # ------------------------------------------------------------- pickers --
@@ -275,6 +388,8 @@ class App(tk.Tk):
             args += ["--prompt", self.prompt_var.get().strip()]
         if not detect_gpu():
             args += ["--device", "cpu"]
+        self._save()
+        self._keep_awake(self.awake_var.get())
         self.start_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
         self.progress.configure(value=0, maximum=1)
@@ -284,14 +399,19 @@ class App(tk.Tk):
         self._run(args, on_done=self._finished)
 
     def _finished(self, code: int) -> None:
+        self._keep_awake(False)
         self.start_btn.configure(state="normal")
         self.stop_btn.configure(state="disabled")
         if code == 0:
             self.progress.configure(value=self.progress["maximum"])
+            if self.sound_var.get():
+                self._ding()
             msg = self._last_line
             if re.search(r"[1-9]\d* failure", msg):
                 msg += "\n\nSome videos failed. The reasons are in errors.log in the digests folder."
-            if messagebox.askyesno("Lecture Digest", f"{msg}\n\nOpen the digests folder now?"):
+            if self.after_var.get() != WHEN_DONE[0]:
+                self._power_action(self.after_var.get())
+            elif messagebox.askyesno("Lecture Digest", f"{msg}\n\nOpen the digests folder now?"):
                 open_folder(Path(self.output_var.get()))
         elif self._last_line.startswith("ERROR"):
             self.status_var.set(self._last_line)
@@ -389,7 +509,50 @@ class App(tk.Tk):
                                                          "(You can continue later.)"):
                 return
             self._stop()
+        self._keep_awake(False)
+        self._save()
         self.destroy()
+
+    # ------------------------------------------------- settings and power --
+    def _save(self) -> None:
+        self.settings.update({
+            "input": self.input_var.get(), "output": self.output_var.get(),
+            "language": self.lang_var.get(), "quality": self.quality_var.get(),
+            "ocr": self.ocr_var.get(), "translate": self.translate_var.get(),
+            "combined": self.combined_var.get(), "prompt": self.prompt_var.get(),
+            "keep_awake": self.awake_var.get(), "when_done": self.after_var.get(),
+            "sound": self.sound_var.get(), "dark": self.dark_var.get()})
+        save_settings(self.settings)
+
+    @staticmethod
+    def _keep_awake(on: bool) -> None:
+        """Stop Windows going to sleep mid-run (the screen may still turn off)."""
+        if os.name != "nt":
+            return
+        import ctypes
+        ES_CONTINUOUS, ES_SYSTEM_REQUIRED = 0x80000000, 0x00000001
+        ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS | (ES_SYSTEM_REQUIRED if on else 0))
+
+    def _ding(self) -> None:
+        try:
+            import winsound
+            winsound.MessageBeep(winsound.MB_ICONASTERISK)
+        except (ImportError, RuntimeError):
+            self.bell()
+
+    def _power_action(self, action: str) -> None:
+        """Sleep or shut down after a 60 s countdown the user can cancel."""
+        if os.name != "nt":
+            return
+        if action == WHEN_DONE[1]:
+            cmd = ["rundll32.exe", "powrprof.dll,SetSuspendState", "0,1,0"]
+        else:
+            cmd = ["shutdown", "/s", "/t", "0"]
+        job = self.after(60_000, lambda: subprocess.Popen(cmd, creationflags=NO_WINDOW))
+        verb = "go to sleep" if action == WHEN_DONE[1] else "shut down"
+        if messagebox.askyesno("Lecture Digest",
+                               f"All done. The PC will {verb} in 1 minute.\n\nCancel that?"):
+            self.after_cancel(job)
 
 
 if __name__ == "__main__":

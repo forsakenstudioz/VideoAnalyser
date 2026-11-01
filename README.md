@@ -30,6 +30,8 @@ video ends up as a few GB of digests.
 4. You can press **Stop** or close it any time. Press **Start** again later and it
    carries on where it stopped.
 5. The **Extra frames** tab saves more pictures from part of a lecture.
+6. Extras: **Dark mode** (top right), **Keep the PC awake** while it runs, and **When done** can put the PC to
+   sleep or shut it down (with a 1-minute chance to cancel). Your folders and options are remembered.
 
 The only thing you need beforehand is an up-to-date NVIDIA driver (NVIDIA App / GeForce
 Experience). To uninstall, delete `%LOCALAPPDATA%\LectureDigest` and the exe.
