@@ -37,6 +37,10 @@ VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".webm", ".flv", ".wmv", ".m4v",
 DEFAULT_OUT = "digests"
 FORMAT_VERSION = 1
 
+# Started from the window app there is no console, so on Windows every ffmpeg /
+# ffprobe call would pop up its own console window. CREATE_NO_WINDOW stops that.
+NO_WINDOW = {"creationflags": 0x08000000} if os.name == "nt" else {}
+
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(errors="replace")
     sys.stderr.reconfigure(errors="replace")
@@ -91,7 +95,7 @@ def probe_duration(video: Path) -> float:
     out = subprocess.run(
         ["ffprobe", "-v", "error", "-show_entries", "format=duration",
          "-of", "default=noprint_wrappers=1:nokey=1", str(video)],
-        capture_output=True, text=True)
+        capture_output=True, text=True, **NO_WINDOW)
     try:
         return float(out.stdout.strip())
     except ValueError:
@@ -252,7 +256,7 @@ def load_audio(video: Path):
     import numpy as np
     cmd = ["ffmpeg", "-hide_banner", "-nostdin", "-v", "error", "-i", str(video),
            "-vn", "-sn", "-dn", "-ac", "1", "-ar", "16000", "-f", "s16le", "-"]
-    proc = subprocess.run(cmd, capture_output=True)
+    proc = subprocess.run(cmd, capture_output=True, **NO_WINDOW)
     if proc.returncode != 0 and not proc.stdout:
         raise RuntimeError("could not read the audio: " + proc.stderr.decode(errors="replace").strip()[-300:])
     return np.frombuffer(proc.stdout, dtype=np.int16).astype(np.float32) / 32768.0
@@ -310,7 +314,7 @@ def sample_frames(video: Path, fps: float, hwaccel: str):
     cmd += ["-i", str(video), "-an", "-sn", "-dn",
             "-vf", f"fps={fps},scale={SAMPLE_W}:{SAMPLE_H}:flags=area,format=gray",
             "-f", "rawvideo", "-"]
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, **NO_WINDOW)
     size, i = SAMPLE_W * SAMPLE_H, 0
     try:
         while True:
@@ -364,7 +368,7 @@ def detect_keyframe_times(video: Path, args) -> list[tuple[float, float]]:
 def grab_frame(video: Path, t: float, dest: Path, width: int) -> bool:
     cmd = ["ffmpeg", "-hide_banner", "-v", "error", "-y", "-ss", f"{t:.2f}", "-i", str(video),
            "-frames:v", "1", "-vf", f"scale='min({width},iw)':-2", "-q:v", "4", str(dest)]
-    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **NO_WINDOW)
     return dest.exists() and dest.stat().st_size > 0
 
 

@@ -2,6 +2,7 @@ faster-whisper>=1.1
 numpy
 rapidocr>=3.0
 onnxruntime
+customtkinter==5.2.2  # the window app's modern look
 # CUDA 12 runtime libraries for the GPU (cuBLAS + cuDNN 9), installed by pip,
 # so you do not need the full CUDA Toolkit. Needs a recent NVIDIA driver.
 nvidia-cublas-cu12
