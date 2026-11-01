@@ -3,25 +3,28 @@ Lecture Digest - simple window for people who do not want to use a terminal.
 
 Runs lecture_digest.py (next to this file) in the background and shows its
 progress. Started by LectureDigest.exe, or directly with:  python gui.py
+Built with customtkinter, in a green "swordsman" theme (dark and light).
 """
 from __future__ import annotations
 
 import json
 import os
 import queue
-import time
 import re
 import shutil
 import subprocess
 import sys
 import threading
-import tkinter as tk
+import time
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox
+
+import customtkinter as ctk
 
 HERE = Path(__file__).resolve().parent
 TOOL = HERE / "lecture_digest.py"
 NO_WINDOW = 0x08000000 if os.name == "nt" else 0  # CREATE_NO_WINDOW
+SETTINGS_FILE = Path.home() / ".lecture_digest_gui.json"
 
 LANGUAGES = {
     "Auto-detect": "auto", "English": "en", "Hindi": "hi", "Tamil": "ta", "Telugu": "te",
@@ -34,8 +37,31 @@ QUALITY = {
     "Most accurate (about 2x slower)": "large-v3",
     "Light (small GPU or no GPU)": "small",
 }
+WHEN_DONE = ["Do nothing", "Sleep", "Shut down"]
 VIDEO_TYPES = [("Videos", "*.mp4 *.mkv *.avi *.mov *.webm *.flv *.wmv *.m4v *.mpg *.mpeg *.ts *.3gp"),
                ("All files", "*.*")]
+
+# Colours as (light, dark). Swordsman green with a touch of katana gold.
+C = {
+    "bg": ("#eef5ef", "#0b1410"),
+    "card": ("#ffffff", "#13221a"),
+    "card2": ("#e3efe6", "#1a2e22"),
+    "border": ("#cfe2d4", "#24402f"),
+    "text": ("#0f2418", "#e8f5ec"),
+    "muted": ("#5b7465", "#8fb39c"),
+    "green": ("#1f8a45", "#3ccf6e"),
+    "green_hover": ("#176b36", "#2fae5b"),
+    "green_dark": ("#145c2e", "#1f8a45"),
+    "gold": ("#a8801c", "#d9b44a"),
+    "danger": ("#b4232a", "#e05252"),
+    "on_green": ("#ffffff", "#06120b"),
+    "log_bg": ("#f6faf7", "#08100c"),
+}
+FONT = "Segoe UI" if os.name == "nt" else "DejaVu Sans"
+
+
+def font(size=13, weight="normal"):
+    return ctk.CTkFont(family=FONT, size=size, weight=weight)
 
 
 def detect_gpu() -> str:
@@ -60,19 +86,6 @@ def open_folder(path: Path) -> None:
         subprocess.Popen(["xdg-open", str(path)])
 
 
-SETTINGS_FILE = Path.home() / ".lecture_digest_gui.json"
-WHEN_DONE = ["Do nothing", "Put the PC to sleep", "Shut down the PC"]
-
-# (light, dark) colours for the app's own label styles
-THEMES = {
-    "light": {"bg": None, "fg": None, "field": None, "hint": "#666666", "muted": "#555555",
-              "good": "#1a7f37", "warn": "#b35900"},
-    "dark": {"bg": "#1f1f1f", "fg": "#e6e6e6", "field": "#2b2b2b", "hint": "#a0a0a0", "muted": "#b0b0b0",
-             "good": "#4ac26b", "warn": "#f0a050", "button": "#333333", "active": "#3d3d3d",
-             "border": "#454545", "accent": "#3b82f6"},
-}
-
-
 def load_settings() -> dict:
     try:
         return json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
@@ -87,239 +100,256 @@ def save_settings(settings: dict) -> None:
         pass
 
 
-def system_prefers_dark() -> bool:
-    if os.name != "nt":
-        return False
-    try:
-        import winreg
-        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
-                             r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize")
-        return winreg.QueryValueEx(key, "AppsUseLightTheme")[0] == 0
-    except OSError:
-        return False
-
-
 def fmt_duration(sec: float) -> str:
     sec = int(sec)
     h, m = sec // 3600, sec % 3600 // 60
     if h >= 24:
-        return f"{h // 24} d {h % 24} h"
-    return f"{h} h {m:02d} min" if h else f"{m} min"
+        return f"{h // 24}d {h % 24}h"
+    return f"{h}h {m:02d}m" if h else f"{m} min"
 
 
-class App(tk.Tk):
+class Card(ctk.CTkFrame):
+    """Rounded panel with an optional small heading."""
+
+    def __init__(self, master, title: str = "", **kw):
+        super().__init__(master, fg_color=C["card"], corner_radius=14, border_width=1,
+                         border_color=C["border"], **kw)
+        if title:
+            ctk.CTkLabel(self, text=title.upper(), font=font(11, "bold"),
+                         text_color=C["green"]).pack(anchor="w", padx=16, pady=(12, 2))
+
+
+class StatTile(ctk.CTkFrame):
+    def __init__(self, master, label: str):
+        super().__init__(master, fg_color=C["card2"], corner_radius=10)
+        self.value = ctk.CTkLabel(self, text="-", font=font(20, "bold"), text_color=C["text"])
+        self.value.pack(anchor="w", padx=12, pady=(8, 0))
+        ctk.CTkLabel(self, text=label, font=font(11), text_color=C["muted"]).pack(anchor="w", padx=12, pady=(0, 8))
+
+    def set(self, text: str) -> None:
+        self.value.configure(text=text)
+
+
+class App(ctk.CTk):
     def __init__(self) -> None:
-        super().__init__()
+        self.settings = st = load_settings()
+        ctk.set_appearance_mode(st.get("appearance", "Dark"))
+        super().__init__(fg_color=C["bg"])
         self.title("Lecture Digest")
-        self.geometry("820x840")
-        self.minsize(700, 560)
+        self.geometry("900x860")
+        self.minsize(760, 640)
         self.proc: subprocess.Popen | None = None
         self.lines: queue.Queue[str | None] = queue.Queue()
+        self._on_done = None
+        self._last_line = ""
 
-        self.settings = st = load_settings()
         pick = lambda key, choices, default: st.get(key) if st.get(key) in choices else default  # noqa: E731
-        self.input_var = tk.StringVar(value=st.get("input", ""))
-        self.output_var = tk.StringVar(value=st.get("output") or str(Path.home() / "Documents" / "LectureDigests"))
-        self.lang_var = tk.StringVar(value=pick("language", LANGUAGES, "Auto-detect"))
-        self.quality_var = tk.StringVar(value=pick("quality", QUALITY, next(iter(QUALITY))))
-        self.ocr_var = tk.BooleanVar(value=st.get("ocr", True))
-        self.translate_var = tk.BooleanVar(value=st.get("translate", False))
-        self.combined_var = tk.BooleanVar(value=st.get("combined", True))
-        self.prompt_var = tk.StringVar(value=st.get("prompt", ""))
-        self.awake_var = tk.BooleanVar(value=st.get("keep_awake", True))
-        self.after_var = tk.StringVar(value=pick("when_done", WHEN_DONE, WHEN_DONE[0]))
-        self.sound_var = tk.BooleanVar(value=st.get("sound", True))
-        self.dark_var = tk.BooleanVar(value=st.get("dark", system_prefers_dark()))
-        self.status_var = tk.StringVar(value="Choose a video or a folder of videos, then press Start.")
+        self.input_var = ctk.StringVar(value=st.get("input", ""))
+        self.output_var = ctk.StringVar(value=st.get("output") or str(Path.home() / "Documents" / "LectureDigests"))
+        self.lang_var = ctk.StringVar(value=pick("language", LANGUAGES, "Auto-detect"))
+        self.quality_var = ctk.StringVar(value=pick("quality", QUALITY, next(iter(QUALITY))))
+        self.ocr_var = ctk.BooleanVar(value=st.get("ocr", True))
+        self.translate_var = ctk.BooleanVar(value=st.get("translate", False))
+        self.combined_var = ctk.BooleanVar(value=st.get("combined", True))
+        self.prompt_var = ctk.StringVar(value=st.get("prompt", ""))
+        self.awake_var = ctk.BooleanVar(value=st.get("keep_awake", True))
+        self.after_var = ctk.StringVar(value=pick("when_done", WHEN_DONE, WHEN_DONE[0]))
+        self.sound_var = ctk.BooleanVar(value=st.get("sound", True))
+        self.appearance_var = ctk.StringVar(value=ctk.get_appearance_mode())
+        self.status_var = ctk.StringVar(value="Choose a video or a folder of videos, then press Start.")
+        self.extra_lecture = ctk.StringVar()
+        self.extra_start = ctk.StringVar(value="00:10:00")
+        self.extra_end = ctk.StringVar(value="00:11:00")
+        self.extra_every = ctk.StringVar(value="5")
 
+        self.gpu = detect_gpu()
+        if not self.gpu:
+            self.quality_var.set("Light (small GPU or no GPU)")
         self._build()
-        self._apply_theme()
         self.after(100, self._pump)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     # ------------------------------------------------------------------ UI --
     def _build(self) -> None:
-        pad = {"padx": 10, "pady": 4}
-        self.style = ttk.Style(self)
-        self.light_theme = "vista" if "vista" in self.style.theme_names() else self.style.theme_use()
+        header = ctk.CTkFrame(self, fg_color="transparent")
+        header.pack(fill="x", padx=22, pady=(18, 6))
+        ctk.CTkFrame(header, width=6, height=46, corner_radius=3, fg_color=C["green"]).pack(side="left", padx=(0, 12))
+        titles = ctk.CTkFrame(header, fg_color="transparent")
+        titles.pack(side="left")
+        ctk.CTkLabel(titles, text="Lecture Digest", font=font(26, "bold"), text_color=C["text"]).pack(anchor="w")
+        ctk.CTkLabel(titles, text="Turn lecture videos into notes you can ask Claude about",
+                     font=font(12), text_color=C["muted"]).pack(anchor="w")
+        ctk.CTkSegmentedButton(header, values=["Dark", "Light"], variable=self.appearance_var,
+                               command=self._set_appearance, font=font(12),
+                               selected_color=C["green"], selected_hover_color=C["green_hover"],
+                               unselected_color=C["card2"], unselected_hover_color=C["border"],
+                               text_color=C["text"]).pack(side="right")
+        chip_text = f"GPU  {self.gpu}" if self.gpu else "No NVIDIA GPU - will run slowly on the CPU"
+        ctk.CTkLabel(header, text=chip_text, font=font(11, "bold"), corner_radius=12,
+                     fg_color=C["card2"], text_color=C["green"] if self.gpu else C["gold"],
+                     padx=12).pack(side="right", padx=12)
 
-        gpu = detect_gpu()
-        gpu_text = (f"GPU found: {gpu}" if gpu else
-                    "No NVIDIA GPU found - it will still work, but slowly. Install/update the NVIDIA driver to use your GPU.")
-        top = ttk.Frame(self)
-        top.pack(fill="x", **pad)
-        ttk.Checkbutton(top, text="Dark mode", variable=self.dark_var,
-                        command=self._toggle_dark).pack(side="right")
-        ttk.Label(top, text=gpu_text, style="Good.TLabel" if gpu else "Warn.TLabel",
-                  wraplength=640).pack(side="left", anchor="w")
-        if not gpu:
-            self.quality_var.set("Light (small GPU or no GPU)")
+        tabs = ctk.CTkTabview(self, fg_color=C["bg"], segmented_button_fg_color=C["card2"],
+                              segmented_button_selected_color=C["green"],
+                              segmented_button_selected_hover_color=C["green_hover"],
+                              segmented_button_unselected_color=C["card2"],
+                              segmented_button_unselected_hover_color=C["border"],
+                              text_color=C["text"], anchor="w")
+        tabs.pack(fill="both", expand=True, padx=16, pady=(0, 14))
+        self._build_main(tabs.add("Make digests"))
+        self._build_extra(tabs.add("Extra frames"))
 
-        nb = ttk.Notebook(self)
-        nb.pack(fill="both", expand=True, padx=10, pady=6)
-        main = ttk.Frame(nb, padding=8)
-        extra = ttk.Frame(nb, padding=8)
-        nb.add(main, text="  Make digests  ")
-        nb.add(extra, text="  Extra frames  ")
-        self._build_main(main)
-        self._build_extra(extra)
+    def _entry(self, parent, var, placeholder="", width=140):
+        return ctk.CTkEntry(parent, textvariable=var, height=36, width=width, corner_radius=10, font=font(12),
+                            fg_color=C["card2"], border_color=C["border"], text_color=C["text"],
+                            placeholder_text=placeholder or None)
 
-    def _toggle_dark(self) -> None:
-        self.settings["dark"] = self.dark_var.get()
-        save_settings(self.settings)
-        self._apply_theme()
+    def _button(self, parent, text, cmd, primary=False, danger=False, **kw):
+        if primary:
+            colors = dict(fg_color=C["green"], hover_color=C["green_hover"], text_color=C["on_green"])
+        elif danger:
+            colors = dict(fg_color="transparent", hover_color=C["card2"], text_color=C["danger"],
+                          border_width=1, border_color=C["danger"])
+        else:
+            colors = dict(fg_color=C["card2"], hover_color=C["border"], text_color=C["text"],
+                          border_width=1, border_color=C["border"])
+        kw.setdefault("height", 36)
+        return ctk.CTkButton(parent, text=text, command=cmd, corner_radius=10,
+                             font=font(12, "bold" if primary else "normal"), **colors, **kw)
 
-    def _apply_theme(self) -> None:
-        dark = self.dark_var.get()
-        c = THEMES["dark" if dark else "light"]
-        st = self.style
-        st.theme_use("clam" if dark else self.light_theme)
-        if dark:
-            st.configure(".", background=c["bg"], foreground=c["fg"], fieldbackground=c["field"],
-                         bordercolor=c["border"], lightcolor=c["border"], darkcolor=c["border"],
-                         troughcolor=c["field"], selectbackground=c["accent"], selectforeground="#ffffff",
-                         insertcolor=c["fg"])
-            st.map(".", foreground=[("disabled", "#777777")])
-            st.configure("TButton", background=c["button"])
-            st.map("TButton", background=[("active", c["active"]), ("disabled", c["bg"])])
-            st.configure("TNotebook", background=c["bg"])
-            st.configure("TNotebook.Tab", background=c["button"], padding=(10, 4))
-            st.map("TNotebook.Tab", background=[("selected", c["field"])])
-            st.map("TCombobox", fieldbackground=[("readonly", c["field"])],
-                   foreground=[("readonly", c["fg"])], background=[("readonly", c["button"])])
-            st.map("TCheckbutton", background=[("active", c["bg"])],
-                   indicatorcolor=[("selected", c["accent"]), ("!selected", c["field"])])
-            st.configure("Horizontal.TProgressbar", background=c["accent"])
-            st.configure("Vertical.TScrollbar", background=c["button"], troughcolor=c["field"],
-                         arrowcolor=c["fg"])
-            st.map("Vertical.TScrollbar", background=[("active", c["active"])])
-        bg = c["bg"] or st.lookup("TFrame", "background") or "SystemButtonFace"
-        for name, key in (("Hint", "hint"), ("Muted", "muted"), ("Good", "good"), ("Warn", "warn")):
-            st.configure(f"{name}.TLabel", foreground=c[key])
-        self.configure(background=bg)
-        self.option_add("*TCombobox*Listbox.background", c["field"] or "white")
-        self.option_add("*TCombobox*Listbox.foreground", c["fg"] or "black")
-        self.log.configure(background=c["field"] or "white", foreground=c["fg"] or "black",
-                           insertbackground=c["fg"] or "black")
-        self._dark_title_bar(dark)
+    def _switch(self, parent, text, var):
+        return ctk.CTkSwitch(parent, text=text, variable=var, font=font(12), text_color=C["text"],
+                             progress_color=C["green"], button_color=("#ffffff", "#e8f5ec"),
+                             button_hover_color=("#f0f0f0", "#ffffff"), fg_color=C["border"])
 
-    def _dark_title_bar(self, dark: bool) -> None:
-        if os.name != "nt":
-            return
-        try:  # Windows 10 1809+ / 11: DWMWA_USE_IMMERSIVE_DARK_MODE
-            import ctypes
-            self.update_idletasks()
-            hwnd = ctypes.windll.user32.GetParent(self.winfo_id())
-            value = ctypes.c_int(1 if dark else 0)
-            ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 20, ctypes.byref(value), ctypes.sizeof(value))
-            self.withdraw()  # redraw so the title bar picks up the change
-            self.deiconify()
-        except (OSError, AttributeError):
-            pass
+    def _menu(self, parent, var, values, width=220):
+        return ctk.CTkOptionMenu(parent, variable=var, values=values, width=width, height=34,
+                                 corner_radius=10, font=font(12), fg_color=C["card2"],
+                                 button_color=C["green_dark"], button_hover_color=C["green"],
+                                 text_color=C["text"], dropdown_fg_color=C["card"],
+                                 dropdown_hover_color=C["card2"], dropdown_text_color=C["text"])
 
-    def _row(self, parent, label, var, buttons):
-        row = ttk.Frame(parent)
-        row.pack(fill="x", pady=3)
-        ttk.Label(row, text=label, width=16).pack(side="left")
-        ttk.Entry(row, textvariable=var).pack(side="left", fill="x", expand=True, padx=(0, 6))
+    def _path_row(self, card, label, var, buttons, placeholder=""):
+        row = ctk.CTkFrame(card, fg_color="transparent")
+        row.pack(fill="x", padx=16, pady=5)
+        ctk.CTkLabel(row, text=label, width=110, anchor="w", font=font(12), text_color=C["muted"]).pack(side="left")
+        self._entry(row, var, placeholder).pack(side="left", fill="x", expand=True, padx=(0, 8))
         for text, cmd in buttons:
-            ttk.Button(row, text=text, command=cmd).pack(side="left", padx=2)
+            self._button(row, text, cmd, width=96).pack(side="left", padx=2)
 
-    def _build_main(self, f: ttk.Frame) -> None:
-        self._row(f, "Videos:", self.input_var,
-                  [("Choose video...", self._pick_video), ("Choose folder...", self._pick_folder)])
-        self._row(f, "Save digests to:", self.output_var, [("Browse...", self._pick_output)])
+    def _build_main(self, tab) -> None:
+        body = ctk.CTkScrollableFrame(tab, fg_color=C["bg"], scrollbar_button_color=C["border"],
+                                      scrollbar_button_hover_color=C["green_dark"])
+        body.pack(fill="both", expand=True)
 
-        opts = ttk.LabelFrame(f, text="Options", padding=8)
-        opts.pack(fill="x", pady=8)
-        r = ttk.Frame(opts)
-        r.pack(fill="x", pady=2)
-        ttk.Label(r, text="Language spoken:", width=16).pack(side="left")
-        ttk.Combobox(r, textvariable=self.lang_var, values=list(LANGUAGES), state="readonly",
-                     width=18).pack(side="left")
-        ttk.Label(r, text="   Quality:").pack(side="left")
-        ttk.Combobox(r, textvariable=self.quality_var, values=list(QUALITY), state="readonly",
-                     width=32).pack(side="left", padx=4)
-        r = ttk.Frame(opts)
-        r.pack(fill="x", pady=2)
-        ttk.Label(r, text="Subject words:", width=16).pack(side="left")
-        ttk.Entry(r, textvariable=self.prompt_var).pack(side="left", fill="x", expand=True)
-        ttk.Label(opts, text="(optional) technical words used in the lectures, so they are spelled right, "
-                             "e.g. enthalpy, Kirchhoff, eigenvalue", style="Hint.TLabel").pack(anchor="w")
-        ttk.Checkbutton(opts, text="Read the text on slides and the board (OCR)",
-                        variable=self.ocr_var).pack(anchor="w", pady=1)
-        ttk.Checkbutton(opts, text="Translate speech to English",
-                        variable=self.translate_var).pack(anchor="w", pady=1)
-        ttk.Checkbutton(opts, text="Also make one combined file of all lectures (ALL_LECTURES.md) for uploading to Claude",
-                        variable=self.combined_var).pack(anchor="w", pady=1)
+        src = Card(body, "Videos")
+        src.pack(fill="x", pady=(0, 10))
+        self._path_row(src, "Videos", self.input_var,
+                       [("Video...", self._pick_video), ("Folder...", self._pick_folder)],
+                       "Pick one video or a whole folder")
+        self._path_row(src, "Save digests to", self.output_var, [("Browse...", self._pick_output)])
+        ctk.CTkFrame(src, height=8, fg_color="transparent").pack()
 
-        run = ttk.LabelFrame(f, text="While running and when finished", padding=8)
-        run.pack(fill="x", pady=(0, 6))
-        r = ttk.Frame(run)
-        r.pack(fill="x")
-        ttk.Checkbutton(r, text="Keep the PC awake", variable=self.awake_var).pack(side="left")
-        ttk.Checkbutton(r, text="Play a sound when done", variable=self.sound_var).pack(side="left", padx=16)
-        ttk.Label(r, text="When done:").pack(side="left", padx=(8, 4))
-        ttk.Combobox(r, textvariable=self.after_var, values=WHEN_DONE, state="readonly",
-                     width=20).pack(side="left")
+        opts = Card(body, "Options")
+        opts.pack(fill="x", pady=(0, 10))
+        grid = ctk.CTkFrame(opts, fg_color="transparent")
+        grid.pack(fill="x", padx=16, pady=4)
+        for col, (label, var, values, width) in enumerate((("Language", self.lang_var, list(LANGUAGES), 180),
+                                                           ("Quality", self.quality_var, list(QUALITY), 260))):
+            ctk.CTkLabel(grid, text=label, width=110 if col == 0 else 0, anchor="w", font=font(12),
+                         text_color=C["muted"]).grid(row=0, column=col * 2, sticky="w", padx=(0 if col == 0 else 18, 8))
+            self._menu(grid, var, values, width=width).grid(row=0, column=col * 2 + 1, sticky="w")
+        row = ctk.CTkFrame(opts, fg_color="transparent")
+        row.pack(fill="x", padx=16, pady=(8, 2))
+        ctk.CTkLabel(row, text="Subject words", width=110, anchor="w", font=font(12),
+                     text_color=C["muted"]).pack(side="left")
+        self._entry(row, self.prompt_var, "Optional, e.g. enthalpy, Kirchhoff, eigenvalue").pack(
+            side="left", fill="x", expand=True)
+        sw = ctk.CTkFrame(opts, fg_color="transparent")
+        sw.pack(fill="x", padx=16, pady=(10, 14))
+        for text, var in (("Read slide and board text (OCR)", self.ocr_var),
+                          ("Translate to English", self.translate_var),
+                          ("One combined file for Claude", self.combined_var)):
+            self._switch(sw, text, var).pack(side="left", padx=(0, 18))
 
-        btns = ttk.Frame(f)
-        btns.pack(fill="x", pady=4)
-        self.start_btn = ttk.Button(btns, text="Start", command=self._start)
+        run = Card(body, "While running")
+        run.pack(fill="x", pady=(0, 10))
+        rr = ctk.CTkFrame(run, fg_color="transparent")
+        rr.pack(fill="x", padx=16, pady=(4, 14))
+        self._switch(rr, "Keep PC awake", self.awake_var).pack(side="left", padx=(0, 18))
+        self._switch(rr, "Sound when done", self.sound_var).pack(side="left", padx=(0, 18))
+        ctk.CTkLabel(rr, text="When done", font=font(12), text_color=C["muted"]).pack(side="left", padx=(6, 8))
+        ctk.CTkSegmentedButton(rr, values=WHEN_DONE, variable=self.after_var, font=font(12),
+                               selected_color=C["green"], selected_hover_color=C["green_hover"],
+                               unselected_color=C["card2"], unselected_hover_color=C["border"],
+                               text_color=C["text"]).pack(side="left")
+
+        actions = ctk.CTkFrame(body, fg_color=C["bg"])
+        actions.pack(fill="x", pady=(2, 10))
+        self.start_btn = self._button(actions, "Start", self._start, primary=True, width=150, height=44)
+        self.start_btn.configure(font=font(15, "bold"))
         self.start_btn.pack(side="left")
-        self.stop_btn = ttk.Button(btns, text="Stop", command=self._stop, state="disabled")
-        self.stop_btn.pack(side="left", padx=6)
-        ttk.Button(btns, text="Open digests folder",
-                   command=lambda: open_folder(Path(self.output_var.get()))).pack(side="right")
+        self.stop_btn = self._button(actions, "Stop", self._stop, danger=True, width=100, height=44)
+        self.stop_btn.configure(state="disabled")
+        self.stop_btn.pack(side="left", padx=10)
+        self._button(actions, "Open digests folder",
+                     lambda: open_folder(Path(self.output_var.get())), width=170, height=44).pack(side="right")
 
-        self.progress = ttk.Progressbar(f, mode="determinate")
-        self.progress.pack(fill="x", pady=4)
-        ttk.Label(f, textvariable=self.status_var, wraplength=760).pack(anchor="w")
+        prog = Card(body, "Progress")
+        prog.pack(fill="x", pady=(0, 10))
+        self.progress = ctk.CTkProgressBar(prog, height=12, corner_radius=6, progress_color=C["green"],
+                                           fg_color=C["card2"])
+        self.progress.set(0)
+        self.progress.pack(fill="x", padx=16, pady=(6, 4))
+        ctk.CTkLabel(prog, textvariable=self.status_var, font=font(12), text_color=C["text"],
+                     wraplength=760, justify="left").pack(anchor="w", padx=16, pady=(0, 6))
+        tiles = ctk.CTkFrame(prog, fg_color="transparent")
+        tiles.pack(fill="x", padx=12, pady=(0, 14))
+        self.tiles: dict[str, StatTile] = {}
+        for i, (key, label) in enumerate([("total", "Total videos"), ("completed", "Completed"),
+                                          ("failed", "Failed"), ("remaining", "Remaining"),
+                                          ("video", "Video done"), ("elapsed", "Time spent"),
+                                          ("eta", "Time left"), ("finish", "Finishes around")]):
+            tiles.columnconfigure(i % 4, weight=1, uniform="t")
+            tile = self.tiles[key] = StatTile(tiles, label)
+            tile.grid(row=i // 4, column=i % 4, sticky="nsew", padx=4, pady=4)
+        self.tiles["eta"].value.configure(text_color=C["green"])
 
-        stats = ttk.LabelFrame(f, text="Progress", padding=(8, 4))
-        stats.pack(fill="x", pady=4)
-        self.stat_vars: dict[str, tk.StringVar] = {}
-        cells = [("total", "Total videos"), ("completed", "Completed"), ("failed", "Failed"),
-                 ("remaining", "Remaining"), ("video", "Video done"), ("elapsed", "Time spent"),
-                 ("eta", "Time left"), ("finish", "Finishes around")]
-        for i, (key, label) in enumerate(cells):
-            col = (i % 4) * 2
-            ttk.Label(stats, text=label + ":", style="Muted.TLabel").grid(row=i // 4, column=col, sticky="w", padx=(0, 4))
-            var = self.stat_vars[key] = tk.StringVar(value="-")
-            ttk.Label(stats, textvariable=var, font=("Segoe UI", 10, "bold")).grid(
-                row=i // 4, column=col + 1, sticky="w", padx=(0, 18))
+        log = Card(body, "Details")
+        log.pack(fill="x", pady=(0, 6))
+        self.log = ctk.CTkTextbox(log, height=170, corner_radius=10, font=ctk.CTkFont(family="Consolas", size=11),
+                                  fg_color=C["log_bg"], text_color=C["muted"], border_width=0, wrap="word")
+        self.log.pack(fill="both", expand=True, padx=12, pady=(4, 12))
+        self.log.configure(state="disabled")
+        ctk.CTkLabel(body, text="You can stop any time; Start again continues where it stopped. When it is done, "
+                                "give Claude the digests folder (or upload ALL_LECTURES.md) and ask your questions.",
+                     font=font(11), text_color=C["muted"], wraplength=780, justify="left").pack(anchor="w", pady=(2, 6))
 
-        box = ttk.Frame(f)
-        box.pack(fill="both", expand=True, pady=4)
-        self.log = tk.Text(box, height=10, wrap="word", font=("Consolas", 9), state="disabled")
-        sb = ttk.Scrollbar(box, command=self.log.yview)
-        self.log.configure(yscrollcommand=sb.set)
-        self.log.pack(side="left", fill="both", expand=True)
-        sb.pack(side="right", fill="y")
-        ttk.Label(f, style="Hint.TLabel", wraplength=760,
-                  text="You can stop at any time. Press Start again later and it continues where it stopped. "
-                       "When it is done, give Claude the digests folder (or upload ALL_LECTURES.md) and ask your questions.").pack(anchor="w")
+    def _build_extra(self, tab) -> None:
+        card = Card(tab, "Save more pictures from part of a lecture")
+        card.pack(fill="x", pady=(0, 10))
+        ctk.CTkLabel(card, wraplength=760, justify="left", font=font(12), text_color=C["muted"], text=(
+            "Useful when the teacher writes a long derivation. Pick the lecture's folder inside your digests "
+            "folder (or the video itself), then the start and end time.")).pack(anchor="w", padx=16, pady=(2, 6))
+        self._path_row(card, "Lecture", self.extra_lecture,
+                       [("Folder...", self._pick_extra_folder), ("Video...", self._pick_extra_video)])
+        r = ctk.CTkFrame(card, fg_color="transparent")
+        r.pack(fill="x", padx=16, pady=8)
+        ctk.CTkLabel(r, text="", width=110).pack(side="left")
+        for label, var, w in (("From (h:mm:ss)", self.extra_start, 100), ("To", self.extra_end, 100),
+                              ("Every (seconds)", self.extra_every, 60)):
+            ctk.CTkLabel(r, text=label, font=font(12), text_color=C["muted"]).pack(side="left", padx=(0, 6))
+            self._entry(r, var, width=w).pack(side="left", padx=(0, 16))
+        self.extra_btn = self._button(card, "Save pictures", self._extra_frames, primary=True, width=160, height=40)
+        self.extra_btn.pack(anchor="w", padx=16, pady=(4, 6))
+        ctk.CTkLabel(card, font=font(11), text_color=C["muted"],
+                     text="Pictures go into the lecture's 'extra_frames' folder, which opens when they are ready."
+                     ).pack(anchor="w", padx=16, pady=(0, 14))
 
-    def _build_extra(self, f: ttk.Frame) -> None:
-        ttk.Label(f, wraplength=740, text=(
-            "Save more pictures from part of a lecture, for example when the teacher writes a long "
-            "derivation. Pick the lecture's folder inside your digests folder (or the video itself), "
-            "then the start and end time.")).pack(anchor="w", pady=(0, 8))
-        self.extra_lecture = tk.StringVar()
-        self.extra_start = tk.StringVar(value="00:10:00")
-        self.extra_end = tk.StringVar(value="00:11:00")
-        self.extra_every = tk.StringVar(value="5")
-        self._row(f, "Lecture:", self.extra_lecture,
-                  [("Lecture folder...", self._pick_extra_folder), ("Video...", self._pick_extra_video)])
-        r = ttk.Frame(f)
-        r.pack(fill="x", pady=6)
-        for label, var, w in (("From (h:mm:ss):", self.extra_start, 10), ("   To:", self.extra_end, 10),
-                              ("   One picture every (seconds):", self.extra_every, 5)):
-            ttk.Label(r, text=label).pack(side="left")
-            ttk.Entry(r, textvariable=var, width=w).pack(side="left", padx=4)
-        ttk.Button(f, text="Save pictures", command=self._extra_frames).pack(anchor="w", pady=6)
-        ttk.Label(f, style="Hint.TLabel", text="Pictures go into the lecture's 'extra_frames' folder, "
-                                             "which opens when they are ready.").pack(anchor="w")
+    def _set_appearance(self, mode: str) -> None:
+        ctk.set_appearance_mode(mode)
+        self.settings["appearance"] = mode
+        save_settings(self.settings)
 
     # ------------------------------------------------------------- pickers --
     def _pick_video(self):
@@ -386,24 +416,26 @@ class App(tk.Tk):
             args.append("--combined")
         if self.prompt_var.get().strip():
             args += ["--prompt", self.prompt_var.get().strip()]
-        if not detect_gpu():
+        if not self.gpu:
             args += ["--device", "cpu"]
         self._save()
         self._keep_awake(self.awake_var.get())
         self.start_btn.configure(state="disabled")
+        self.extra_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
-        self.progress.configure(value=0, maximum=1)
-        for var in self.stat_vars.values():
-            var.set("-")
+        self.progress.set(0)
+        for tile in self.tiles.values():
+            tile.set("-")
         self.status_var.set("Starting... (the first time it downloads the speech model, about 1.6 GB)")
         self._run(args, on_done=self._finished)
 
     def _finished(self, code: int) -> None:
         self._keep_awake(False)
         self.start_btn.configure(state="normal")
+        self.extra_btn.configure(state="normal")
         self.stop_btn.configure(state="disabled")
         if code == 0:
-            self.progress.configure(value=self.progress["maximum"])
+            self.progress.set(1)
             if self.sound_var.get():
                 self._ding()
             msg = self._last_line
@@ -439,9 +471,11 @@ class App(tk.Tk):
         args = ["frames", str(Path(lecture).resolve()), "--start", self.extra_start.get(), "--end", self.extra_end.get(),
                 "--every", self.extra_every.get() or "5", "-o", str(Path(self.output_var.get().strip()).resolve())]
         self.start_btn.configure(state="disabled")
+        self.extra_btn.configure(state="disabled")
 
         def done(code):
             self.start_btn.configure(state="normal")
+            self.extra_btn.configure(state="normal")
             m = re.search(r"Saved \d+ frame\(s\) to (.+)$", self._last_line)
             if code == 0 and m:
                 open_folder(Path(m.group(1)))
@@ -449,8 +483,6 @@ class App(tk.Tk):
                 messagebox.showwarning("Lecture Digest", self._last_line or "Could not save pictures.")
 
         self._run(args, on_done=done)
-
-    _last_line = ""
 
     def _pump(self) -> None:
         try:
@@ -472,8 +504,7 @@ class App(tk.Tk):
         self.after(150, self._pump)
 
     def _update_status(self, text: str) -> None:
-        if m := re.match(r"Found (\d+) video", text):
-            self.progress.configure(maximum=max(1, int(m.group(1))), value=0)
+        if text.startswith("Found "):
             self.status_var.set(text)
         elif text.startswith("=== "):
             self.status_var.set("Working on: " + Path(text[4:]).name)
@@ -488,20 +519,20 @@ class App(tk.Tk):
         except ValueError:
             return
         done_sec = p["total_sec"] - p["left_sec"]
-        v = self.stat_vars
-        v["total"].set(str(p["total"]))
-        v["completed"].set(str(p["completed"]) + (f" ({p['skipped']} done earlier)" if p["skipped"] else ""))
-        v["failed"].set(str(p["failed"]))
-        v["remaining"].set(str(p["remaining"]))
-        v["video"].set(f"{fmt_duration(done_sec)} of {fmt_duration(p['total_sec'])}")
-        v["elapsed"].set(fmt_duration(p["elapsed_sec"]))
+        t = self.tiles
+        t["total"].set(str(p["total"]))
+        t["completed"].set(str(p["completed"]))
+        t["failed"].set(str(p["failed"]))
+        t["remaining"].set(str(p["remaining"]))
+        t["video"].set(f"{fmt_duration(done_sec)} / {fmt_duration(p['total_sec'])}")
+        t["elapsed"].set(fmt_duration(p["elapsed_sec"]))
         if p["eta_sec"] is None:
-            v["eta"].set("estimating..." if p["remaining"] else "0 min")
-            v["finish"].set("-")
+            t["eta"].set("estimating" if p["remaining"] else "0 min")
+            t["finish"].set("-")
         else:
-            v["eta"].set(fmt_duration(p["eta_sec"]))
-            v["finish"].set(time.strftime("%a %d %b, %I:%M %p", time.localtime(time.time() + p["eta_sec"])))
-        self.progress.configure(maximum=max(1, p["total_sec"]), value=done_sec)
+            t["eta"].set(fmt_duration(p["eta_sec"]))
+            t["finish"].set(time.strftime("%a %I:%M %p", time.localtime(time.time() + p["eta_sec"])))
+        self.progress.set(done_sec / p["total_sec"] if p["total_sec"] else 0)
 
     def _on_close(self) -> None:
         if self.proc and self.proc.poll() is None:
@@ -521,7 +552,7 @@ class App(tk.Tk):
             "ocr": self.ocr_var.get(), "translate": self.translate_var.get(),
             "combined": self.combined_var.get(), "prompt": self.prompt_var.get(),
             "keep_awake": self.awake_var.get(), "when_done": self.after_var.get(),
-            "sound": self.sound_var.get(), "dark": self.dark_var.get()})
+            "sound": self.sound_var.get(), "appearance": self.appearance_var.get()})
         save_settings(self.settings)
 
     @staticmethod
@@ -544,12 +575,12 @@ class App(tk.Tk):
         """Sleep or shut down after a 60 s countdown the user can cancel."""
         if os.name != "nt":
             return
-        if action == WHEN_DONE[1]:
+        if action == "Sleep":
             cmd = ["rundll32.exe", "powrprof.dll,SetSuspendState", "0,1,0"]
         else:
             cmd = ["shutdown", "/s", "/t", "0"]
         job = self.after(60_000, lambda: subprocess.Popen(cmd, creationflags=NO_WINDOW))
-        verb = "go to sleep" if action == WHEN_DONE[1] else "shut down"
+        verb = "go to sleep" if action == "Sleep" else "shut down"
         if messagebox.askyesno("Lecture Digest",
                                f"All done. The PC will {verb} in 1 minute.\n\nCancel that?"):
             self.after_cancel(job)
